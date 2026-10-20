@@ -1,0 +1,21 @@
+[project]
+name = "reverse-eng-anything"
+version = "0.1.0"
+description = "Automated reverse-engineering triage framework with a red-team styled TUI"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.58",
+    "rich>=13.0",
+    "r2pipe>=1.8",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+rea = "reverse_eng_anything.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

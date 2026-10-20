@@ -1,0 +1,138 @@
+"""Decompiles a binary back into C source, grouped into modules.
+
+Backend: radare2's decompiler (r2ghidra's `pdg`, falling back to r2dec's
+`pdc`, falling back to r2's own `pdc` pseudo-C). Output is best-effort —
+stripped, optimized, or obfuscated binaries will produce pseudocode that
+needs manual cleanup before it actually compiles. This module does not
+pretend otherwise: every generated module is tagged with a confidence note.
+
+Functions are grouped into "modules" (think: original .c files) using a
+simple, inspectable heuristic — see `group_into_modules` — so the result is
+something a human can navigate and edit, not one giant blob.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .disasm import DisasmResult, FunctionInfo
+
+try:
+    import r2pipe  # type: ignore
+except ImportError:  # pragma: no cover
+    r2pipe = None
+
+
+@dataclass
+class FunctionSource:
+    name: str
+    offset: int
+    c_source: str
+    confidence: str = "low"  # low | medium | high — never claimed "exact"
+
+
+@dataclass
+class ModuleSource:
+    name: str
+    functions: list[FunctionSource] = field(default_factory=list)
+    is_main_module: bool = False  # flagged by the rewrite interface as a primary target
+
+    @property
+    def c_source(self) -> str:
+        header = f"/* module: {self.name} (best-effort decompilation — review before building) */\n\n"
+        return header + "\n\n".join(f.c_source for f in self.functions)
+
+
+@dataclass
+class DecompiledProject:
+    source_dir: Path
+    modules: list[ModuleSource] = field(default_factory=list)
+    language: str = "c"
+
+    def module_by_name(self, name: str) -> ModuleSource | None:
+        return next((m for m in self.modules if m.name == name), None)
+
+
+# --- grouping heuristic -----------------------------------------------------
+
+def group_into_modules(functions: list[FunctionInfo]) -> dict[str, list[FunctionInfo]]:
+    """Group functions by name prefix up to the first underscore/dot, falling
+    back to a shared 'core' module. This mirrors how C projects are commonly
+    organized (module_verb_noun) without requiring debug info. Analysts can
+    re-group manually afterward through the rewrite interface.
+    """
+    groups: dict[str, list[FunctionInfo]] = {}
+    for fn in functions:
+        name = fn.name
+        if name.startswith("sym.imp.") or name.startswith("reloc."):
+            continue  # library/import stubs aren't ours to "decompile"
+        base = name.split(".")[-1] if "." in name else name
+        prefix = base.split("_")[0] if "_" in base else "core"
+        groups.setdefault(prefix or "core", []).append(fn)
+    return groups
+
+
+# --- decompiler backend ------------------------------------------------------
+
+class Decompiler:
+    """Wraps r2's decompiler plugins. Mockable via r2_factory for tests."""
+
+    def __init__(self, r2_factory: Any = None):
+        self._r2_factory = r2_factory or (r2pipe.open if r2pipe else None)
+
+    def _decompile_function(self, r2, fn: FunctionInfo) -> FunctionSource:
+        r2.cmd(f"s {fn.offset}")
+        for cmd, confidence in (("pdg", "medium"), ("pdc", "low")):
+            out = r2.cmd(cmd)
+            if out and out.strip() and "Cannot find" not in out:
+                return FunctionSource(name=fn.name, offset=fn.offset, c_source=out, confidence=confidence)
+        stub = f"/* decompilation unavailable for {fn.name} @ 0x{fn.offset:x} — needs manual RE */\n"
+        return FunctionSource(name=fn.name, offset=fn.offset, c_source=stub, confidence="low")
+
+    def decompile(self, path: str | Path, disasm: DisasmResult, out_dir: str | Path) -> DecompiledProject:
+        if self._r2_factory is None:
+            raise RuntimeError("r2pipe not available — install radare2 (+ r2ghidra for better output)")
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        r2 = self._r2_factory(str(path))
+        try:
+            r2.cmd("aaa")
+            groups = group_into_modules(disasm.functions)
+            modules: list[ModuleSource] = []
+            for module_name, fns in groups.items():
+                sources = [self._decompile_function(r2, fn) for fn in fns]
+                modules.append(ModuleSource(name=module_name, functions=sources))
+        finally:
+            r2.quit()
+
+        project = DecompiledProject(source_dir=out_dir, modules=modules)
+        write_project(project)
+        return project
+
+
+def write_project(project: DecompiledProject) -> None:
+    """Writes one .c file per module plus a best-effort Makefile. Compiling
+    will very likely need manual fixes (undeclared types, calling-convention
+    mismatches, missing headers) — this writes a starting point, not a
+    guaranteed-working build.
+    """
+    project.source_dir.mkdir(parents=True, exist_ok=True)
+    for module in project.modules:
+        (project.source_dir / f"{module.name}.c").write_text(module.c_source)
+
+    makefile = (
+        "# Auto-generated by REA — best-effort build, review before trusting output.\n"
+        "CC ?= cc\n"
+        "CFLAGS ?= -O0 -g -Wall\n"
+        f"SRCS = {' '.join(m.name + '.c' for m in project.modules)}\n"
+        "OBJS = $(SRCS:.c=.o)\n\n"
+        "all: rebuilt_binary\n\n"
+        "rebuilt_binary: $(OBJS)\n"
+        "\t$(CC) $(CFLAGS) -o $@ $(OBJS)\n\n"
+        "clean:\n"
+        "\trm -f $(OBJS) rebuilt_binary\n"
+    )
+    (project.source_dir / "Makefile").write_text(makefile)

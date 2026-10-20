@@ -1,0 +1,4 @@
+textual>=0.58
+rich>=13.0
+r2pipe>=1.8
+requests>=2.31
